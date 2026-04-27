@@ -46,6 +46,7 @@ class Transaction:
     amount: float
     note: str
     account_id: str
+    transfer_to_account_id: str
 
 
 def ensure_storage() -> None:
@@ -92,6 +93,7 @@ def load_transactions() -> List[Transaction]:
                 amount=float(item["amount"]),
                 note=item.get("note", ""),
                 account_id=item.get("account_id", ""),
+                transfer_to_account_id=item.get("transfer_to_account_id", ""),
             )
         )
     return transactions
@@ -131,22 +133,23 @@ def initialize_state() -> None:
         changed = False
         migrated: List[Transaction] = []
         for item in st.session_state.transactions:
-            if not item.account_id:
-                migrated.append(
-                    Transaction(
-                        id=item.id,
-                        entry_date=item.entry_date,
-                        title=item.title,
-                        category=item.category,
-                        kind=item.kind,
-                        amount=item.amount,
-                        note=item.note,
-                        account_id=default_account_id,
-                    )
-                )
+            account_id = item.account_id or default_account_id
+            transfer_to_account_id = getattr(item, "transfer_to_account_id", "") or ""
+            if account_id != item.account_id or transfer_to_account_id != getattr(item, "transfer_to_account_id", ""):
                 changed = True
-            else:
-                migrated.append(item)
+            migrated.append(
+                Transaction(
+                    id=item.id,
+                    entry_date=item.entry_date,
+                    title=item.title,
+                    category=item.category,
+                    kind=item.kind,
+                    amount=item.amount,
+                    note=item.note,
+                    account_id=account_id,
+                    transfer_to_account_id=transfer_to_account_id,
+                )
+            )
         st.session_state.transactions = migrated
         if changed:
             save_transactions(st.session_state.transactions)
@@ -186,6 +189,7 @@ def add_transaction(
     amount: float,
     note: str,
     account_id: str,
+    transfer_to_account_id: str = "",
 ) -> None:
     transaction = Transaction(
         id=str(uuid4()),
@@ -196,9 +200,33 @@ def add_transaction(
         amount=round(float(amount), 2),
         note=note.strip(),
         account_id=account_id,
+        transfer_to_account_id=transfer_to_account_id,
     )
     st.session_state.transactions.insert(0, transaction)
     save_transactions(st.session_state.transactions)
+
+
+def add_transfer(
+    entry_date: date,
+    from_account_id: str,
+    to_account_id: str,
+    amount: float,
+    note: str,
+) -> None:
+    accounts = accounts_by_id(st.session_state.accounts)
+    from_name = accounts.get(from_account_id, Account(id="", name="(Unknown)", starting_balance=0.0)).name
+    to_name = accounts.get(to_account_id, Account(id="", name="(Unknown)", starting_balance=0.0)).name
+    title = f"Transfer {from_name} → {to_name}"
+    add_transaction(
+        entry_date=entry_date,
+        title=title,
+        category="Transfer",
+        kind="Transfer",
+        amount=round(float(amount), 2),
+        note=note,
+        account_id=from_account_id,
+        transfer_to_account_id=to_account_id,
+    )
 
 
 def delete_transaction(transaction_id: str) -> None:
@@ -217,14 +245,30 @@ def build_dataframe(transactions: List[Transaction]) -> pd.DataFrame:
     accounts = accounts_by_id(st.session_state.accounts)
     rows = []
     for item in transactions:
+        account_name = accounts.get(
+            item.account_id, Account(id="", name="(Unknown)", starting_balance=0.0)
+        ).name
+        transfer_to_name = ""
+        if item.transfer_to_account_id:
+            transfer_to_name = accounts.get(
+                item.transfer_to_account_id,
+                Account(id="", name="(Unknown)", starting_balance=0.0),
+            ).name
+
+        account_display = (
+            f"{account_name} → {transfer_to_name}"
+            if item.kind == "Transfer" and transfer_to_name
+            else account_name
+        )
         rows.append(
             {
                 "ID": item.id,
                 "Date": datetime.fromisoformat(item.entry_date).strftime("%Y-%m-%d"),
                 "Title": item.title,
                 "Category": item.category,
-                "Account": accounts.get(item.account_id, Account(id="", name="(Unknown)", starting_balance=0.0)).name,
+                "Account": account_display,
                 "AccountID": item.account_id,
+                "TransferToAccountID": item.transfer_to_account_id,
                 "Type": item.kind,
                 "Amount": item.amount,
                 "Note": item.note,
@@ -238,7 +282,9 @@ def filtered_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     st.sidebar.header("Filters")
-    selected_type = st.sidebar.selectbox("Transaction type", ["All", "Income", "Expense"])
+    selected_type = st.sidebar.selectbox(
+        "Transaction type", ["All", "Income", "Expense", "Transfer"]
+    )
     categories = ["All"] + sorted(df["Category"].dropna().unique().tolist())
     selected_category = st.sidebar.selectbox("Category", categories)
     accounts = ["All"] + sorted(df["Account"].dropna().unique().tolist())
@@ -274,8 +320,13 @@ def compute_account_balances(all_df: pd.DataFrame) -> Dict[str, float]:
         amount = float(row["Amount"])
         if row["Type"] == "Income":
             balances[account_id] += amount
-        else:
+        elif row["Type"] == "Expense":
             balances[account_id] -= amount
+        elif row["Type"] == "Transfer":
+            balances[account_id] -= amount
+            to_account_id = row.get("TransferToAccountID", "")
+            if to_account_id and to_account_id in balances:
+                balances[to_account_id] += amount
     return balances
 
 
@@ -463,6 +514,34 @@ def render_manage_accounts() -> None:
                 st.sidebar.success(f"Imported {imported} rows. Skipped {skipped}.")
                 st.rerun()
 
+    with st.sidebar.expander("Transfer money", expanded=False):
+        accounts = st.session_state.accounts
+        if len(accounts) < 2:
+            st.info("Add at least 2 accounts to make transfers.")
+        else:
+            names = [a.name for a in accounts]
+            t_date = st.date_input("Date", value=date.today(), key="transfer_date")
+            from_name = st.selectbox("From", names, key="transfer_from")
+            to_name = st.selectbox("To", names, index=1 if len(names) > 1 else 0, key="transfer_to")
+            t_amount = st.number_input(
+                "Amount",
+                min_value=0.01,
+                step=100.0,
+                format="%.2f",
+                key="transfer_amount",
+            )
+            t_note = st.text_input("Note", key="transfer_note", placeholder="Optional")
+
+            if st.button("Transfer", type="primary", use_container_width=True):
+                if from_name == to_name:
+                    st.error("From and To accounts must be different.")
+                else:
+                    from_id = next(a.id for a in accounts if a.name == from_name)
+                    to_id = next(a.id for a in accounts if a.name == to_name)
+                    add_transfer(t_date, from_id, to_id, t_amount, t_note.strip())
+                    st.success("Transfer added.")
+                    st.rerun()
+
     with st.sidebar.expander("Add account/card", expanded=False):
         name = st.text_input("Name", key="new_account_name", placeholder="Kaspi Card")
         starting_balance = st.number_input(
@@ -499,10 +578,14 @@ def render_transactions(df: pd.DataFrame) -> None:
         st.info("No transactions yet. Add your first income or expense above.")
         return
 
-    drop_cols = [c for c in ["ID", "AccountID"] if c in df.columns]
+    drop_cols = [c for c in ["ID", "AccountID", "TransferToAccountID"] if c in df.columns]
     display_df = df.drop(columns=drop_cols).copy()
     display_df["Amount"] = display_df.apply(
-        lambda row: format_currency(row["Amount"]) if row["Type"] == "Income" else f"-{format_currency(row['Amount'])}",
+        lambda row: format_currency(row["Amount"])
+        if row["Type"] == "Income"
+        else f"-{format_currency(row['Amount'])}"
+        if row["Type"] == "Expense"
+        else format_currency(row["Amount"]),
         axis=1,
     )
     st.dataframe(display_df, use_container_width=True, hide_index=True)
