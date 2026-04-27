@@ -1,0 +1,20 @@
+[
+  {
+    "id": "d2f5e25b-9a07-4e07-a37c-a3829e159579",
+    "entry_date": "2026-04-27",
+    "title": "Salary",
+    "category": "Salary",
+    "kind": "Income",
+    "amount": 10.0,
+    "note": ""
+  },
+  {
+    "id": "b52d92ac-c1a6-4b20-b530-132e72d96e2f",
+    "entry_date": "2026-04-27",
+    "title": "Shoping",
+    "category": "Shopping",
+    "kind": "Expense",
+    "amount": 1.0,
+    "note": "Jacket"
+  }
+]
