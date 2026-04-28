@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hmac
 import json
+import os
+import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -15,6 +18,7 @@ APP_TITLE = "Finance Tracker"
 DATA_DIR = Path("data")
 DATA_FILE = DATA_DIR / "transactions.json"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
+DB_FILE = DATA_DIR / "finance.db"
 CATEGORIES = [
     "Salary",
     "Food",
@@ -27,6 +31,72 @@ CATEGORIES = [
     "Savings",
     "Other",
 ]
+
+
+def get_auth_config() -> Tuple[str, str]:
+    username = ""
+    password = ""
+
+    try:
+        username = str(st.secrets.get("APP_USERNAME", "")).strip()
+        password = str(st.secrets.get("APP_PASSWORD", "")).strip()
+    except Exception:
+        pass
+
+    username = username or os.getenv("APP_USERNAME", "").strip()
+    password = password or os.getenv("APP_PASSWORD", "").strip()
+    return username, password
+
+
+def is_auth_enabled() -> bool:
+    username, password = get_auth_config()
+    return bool(username and password)
+
+
+def check_credentials(username: str, password: str) -> bool:
+    expected_username, expected_password = get_auth_config()
+    return hmac.compare_digest(username, expected_username) and hmac.compare_digest(
+        password, expected_password
+    )
+
+
+def render_login() -> bool:
+    if "is_authenticated" not in st.session_state:
+        st.session_state.is_authenticated = False
+
+    if not is_auth_enabled():
+        st.info(
+            "Authentication is currently disabled. Set APP_USERNAME and APP_PASSWORD "
+            "in Streamlit secrets or environment variables to enable login."
+        )
+        st.session_state.is_authenticated = True
+        return True
+
+    if st.session_state.is_authenticated:
+        return True
+
+    st.title(APP_TITLE)
+    st.caption("Sign in to access your finance data.")
+
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", use_container_width=True)
+
+        if submitted:
+            if check_credentials(username.strip(), password):
+                st.session_state.is_authenticated = True
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+
+    return False
+
+
+def render_logout() -> None:
+    if is_auth_enabled() and st.sidebar.button("Log out", use_container_width=True):
+        st.session_state.is_authenticated = False
+        st.rerun()
 
 
 @dataclass
@@ -57,28 +127,66 @@ def ensure_storage() -> None:
         ACCOUNTS_FILE.write_text("[]", encoding="utf-8")
 
 
-def load_accounts() -> List[Account]:
+def db_connect() -> sqlite3.Connection:
+    ensure_storage()
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
+    return conn
+
+
+def db_init() -> None:
+    with db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL UNIQUE,
+              starting_balance REAL NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS transactions (
+              id TEXT PRIMARY KEY,
+              entry_date TEXT NOT NULL,
+              title TEXT NOT NULL,
+              category TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              amount REAL NOT NULL,
+              note TEXT NOT NULL DEFAULT '',
+              account_id TEXT NOT NULL,
+              transfer_to_account_id TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(entry_date);
+            CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions(account_id);
+            """
+        )
+
+
+def db_is_empty() -> bool:
+    db_init()
+    with db_connect() as conn:
+        a = conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()["c"]
+        t = conn.execute("SELECT COUNT(*) AS c FROM transactions").fetchone()["c"]
+    return int(a) == 0 and int(t) == 0
+
+
+def load_accounts_json() -> List[Account]:
     ensure_storage()
     raw = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
-    accounts: List[Account] = []
-    for item in raw:
-        accounts.append(
-            Account(
-                id=item["id"],
-                name=item["name"],
-                starting_balance=float(item.get("starting_balance", 0.0)),
-            )
+    return [
+        Account(
+            id=item["id"],
+            name=item["name"],
+            starting_balance=float(item.get("starting_balance", 0.0)),
         )
-    return accounts
+        for item in raw
+    ]
 
 
-def save_accounts(accounts: List[Account]) -> None:
-    ensure_storage()
-    payload = [asdict(account) for account in accounts]
-    ACCOUNTS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def load_transactions() -> List[Transaction]:
+def load_transactions_json() -> List[Transaction]:
     ensure_storage()
     raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
     transactions: List[Transaction] = []
@@ -99,10 +207,89 @@ def load_transactions() -> List[Transaction]:
     return transactions
 
 
-def save_transactions(transactions: List[Transaction]) -> None:
-    ensure_storage()
-    payload = [asdict(transaction) for transaction in transactions]
-    DATA_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+def migrate_json_to_sqlite_if_needed() -> None:
+    """
+    One-time migration: if SQLite is empty, import existing JSON accounts/transactions.
+    JSON files remain as a backup.
+    """
+    if not db_is_empty():
+        return
+
+    accounts = load_accounts_json()
+    transactions = load_transactions_json()
+
+    with db_connect() as conn:
+        for account in accounts:
+            conn.execute(
+                "INSERT OR IGNORE INTO accounts (id, name, starting_balance) VALUES (?, ?, ?)",
+                (account.id, account.name, float(account.starting_balance)),
+            )
+        for tx in transactions:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO transactions
+                (id, entry_date, title, category, kind, amount, note, account_id, transfer_to_account_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tx.id,
+                    tx.entry_date,
+                    tx.title,
+                    tx.category,
+                    tx.kind,
+                    float(tx.amount),
+                    tx.note or "",
+                    tx.account_id,
+                    tx.transfer_to_account_id or "",
+                ),
+            )
+
+
+def load_accounts() -> List[Account]:
+    db_init()
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, name, starting_balance FROM accounts ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+    return [
+        Account(
+            id=row["id"],
+            name=row["name"],
+            starting_balance=float(row["starting_balance"]),
+        )
+        for row in rows
+    ]
+
+
+def load_transactions() -> List[Transaction]:
+    db_init()
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, entry_date, title, category, kind, amount, note, account_id, transfer_to_account_id
+            FROM transactions
+            ORDER BY entry_date DESC, created_at DESC
+            """
+        ).fetchall()
+    return [
+        Transaction(
+            id=row["id"],
+            entry_date=row["entry_date"],
+            title=row["title"],
+            category=row["category"],
+            kind=row["kind"],
+            amount=float(row["amount"]),
+            note=row["note"] or "",
+            account_id=row["account_id"],
+            transfer_to_account_id=row["transfer_to_account_id"] or "",
+        )
+        for row in rows
+    ]
+
+
+def refresh_state_from_db() -> None:
+    st.session_state.accounts = load_accounts()
+    st.session_state.transactions = load_transactions()
 
 
 def parse_amount(value: str) -> float:
@@ -120,39 +307,20 @@ def format_currency(value: float) -> str:
 
 
 def initialize_state() -> None:
-    if "accounts" not in st.session_state:
-        st.session_state.accounts = load_accounts()
-        if not st.session_state.accounts:
-            default = Account(id=str(uuid4()), name="Cash", starting_balance=0.0)
-            st.session_state.accounts = [default]
-            save_accounts(st.session_state.accounts)
+    db_init()
+    migrate_json_to_sqlite_if_needed()
 
-    if "transactions" not in st.session_state:
-        st.session_state.transactions = load_transactions()
-        default_account_id = st.session_state.accounts[0].id
-        changed = False
-        migrated: List[Transaction] = []
-        for item in st.session_state.transactions:
-            account_id = item.account_id or default_account_id
-            transfer_to_account_id = getattr(item, "transfer_to_account_id", "") or ""
-            if account_id != item.account_id or transfer_to_account_id != getattr(item, "transfer_to_account_id", ""):
-                changed = True
-            migrated.append(
-                Transaction(
-                    id=item.id,
-                    entry_date=item.entry_date,
-                    title=item.title,
-                    category=item.category,
-                    kind=item.kind,
-                    amount=item.amount,
-                    note=item.note,
-                    account_id=account_id,
-                    transfer_to_account_id=transfer_to_account_id,
-                )
+    if "accounts" not in st.session_state or "transactions" not in st.session_state:
+        refresh_state_from_db()
+
+    if not st.session_state.accounts:
+        default = Account(id=str(uuid4()), name="Cash", starting_balance=0.0)
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO accounts (id, name, starting_balance) VALUES (?, ?, ?)",
+                (default.id, default.name, float(default.starting_balance)),
             )
-        st.session_state.transactions = migrated
-        if changed:
-            save_transactions(st.session_state.transactions)
+        refresh_state_from_db()
 
 
 def accounts_by_id(accounts: List[Account]) -> Dict[str, Account]:
@@ -165,19 +333,29 @@ def account_label(account: Account) -> str:
 
 def add_account(name: str, starting_balance: float) -> None:
     account = Account(id=str(uuid4()), name=name.strip(), starting_balance=float(starting_balance))
-    st.session_state.accounts.append(account)
-    save_accounts(st.session_state.accounts)
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO accounts (id, name, starting_balance) VALUES (?, ?, ?)",
+            (account.id, account.name, float(account.starting_balance)),
+        )
+    refresh_state_from_db()
 
 
 def delete_account(account_id: str) -> Tuple[bool, str]:
     used = any(item.account_id == account_id for item in st.session_state.transactions)
     if used:
         return False, "This account has transactions. Delete or move them first."
-    st.session_state.accounts = [a for a in st.session_state.accounts if a.id != account_id]
+    with db_connect() as conn:
+        conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+    refresh_state_from_db()
     if not st.session_state.accounts:
         default = Account(id=str(uuid4()), name="Cash", starting_balance=0.0)
-        st.session_state.accounts = [default]
-    save_accounts(st.session_state.accounts)
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO accounts (id, name, starting_balance) VALUES (?, ?, ?)",
+                (default.id, default.name, float(default.starting_balance)),
+            )
+        refresh_state_from_db()
     return True, "Account deleted."
 
 
@@ -202,8 +380,26 @@ def add_transaction(
         account_id=account_id,
         transfer_to_account_id=transfer_to_account_id,
     )
-    st.session_state.transactions.insert(0, transaction)
-    save_transactions(st.session_state.transactions)
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO transactions
+            (id, entry_date, title, category, kind, amount, note, account_id, transfer_to_account_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transaction.id,
+                transaction.entry_date,
+                transaction.title,
+                transaction.category,
+                transaction.kind,
+                float(transaction.amount),
+                transaction.note or "",
+                transaction.account_id,
+                transaction.transfer_to_account_id or "",
+            ),
+        )
+    refresh_state_from_db()
 
 
 def add_transfer(
@@ -230,10 +426,9 @@ def add_transfer(
 
 
 def delete_transaction(transaction_id: str) -> None:
-    st.session_state.transactions = [
-        item for item in st.session_state.transactions if item.id != transaction_id
-    ]
-    save_transactions(st.session_state.transactions)
+    with db_connect() as conn:
+        conn.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+    refresh_state_from_db()
 
 
 def build_dataframe(transactions: List[Transaction]) -> pd.DataFrame:
@@ -336,6 +531,10 @@ def get_or_create_account_id(account_name: str) -> str:
         if account.name.strip().lower() == name.lower():
             return account.id
     add_account(name, 0.0)
+    # state refreshed in add_account()
+    for account in st.session_state.accounts:
+        if account.name.strip().lower() == name.lower():
+            return account.id
     return st.session_state.accounts[-1].id
 
 
@@ -619,11 +818,16 @@ def render_category_chart(df: pd.DataFrame) -> None:
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="💰", layout="wide")
+
+    if not render_login():
+        return
+
     initialize_state()
 
     st.title(APP_TITLE)
     st.caption("Track your income and expenses in one place.")
 
+    render_logout()
     render_manage_accounts()
     render_add_form()
     df = build_dataframe(st.session_state.transactions)
