@@ -33,6 +33,8 @@ CATEGORIES = [
 ]
 
 
+# Read login credentials from Streamlit secrets first, then fall back to
+# environment variables. This lets us keep passwords out of the code.
 def get_auth_config() -> Tuple[str, str]:
     username = ""
     password = ""
@@ -64,6 +66,7 @@ def render_login() -> bool:
     if "is_authenticated" not in st.session_state:
         st.session_state.is_authenticated = False
 
+    # If auth is not configured, allow direct access for local development.
     if not is_auth_enabled():
         st.info(
             "Authentication is currently disabled. Set APP_USERNAME and APP_PASSWORD "
@@ -127,6 +130,7 @@ def ensure_storage() -> None:
         ACCOUNTS_FILE.write_text("[]", encoding="utf-8")
 
 
+# Create a reusable SQLite connection with row access by column name.
 def db_connect() -> sqlite3.Connection:
     ensure_storage()
     conn = sqlite3.connect(DB_FILE)
@@ -136,6 +140,7 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+# Create tables only if they do not already exist.
 def db_init() -> None:
     with db_connect() as conn:
         conn.executescript(
@@ -212,6 +217,7 @@ def migrate_json_to_sqlite_if_needed() -> None:
     One-time migration: if SQLite is empty, import existing JSON accounts/transactions.
     JSON files remain as a backup.
     """
+    # Only migrate once. After data exists in SQLite, JSON stays as backup only.
     if not db_is_empty():
         return
 
@@ -288,6 +294,8 @@ def load_transactions() -> List[Transaction]:
 
 
 def refresh_state_from_db() -> None:
+    # Streamlit keeps values in session_state between reruns, so we refresh
+    # both collections after every database write.
     st.session_state.accounts = load_accounts()
     st.session_state.transactions = load_transactions()
 
@@ -307,6 +315,10 @@ def format_currency(value: float) -> str:
 
 
 def initialize_state() -> None:
+    # App startup order:
+    # 1. make sure the database schema exists
+    # 2. migrate old JSON data if needed
+    # 3. load fresh data into Streamlit session state
     db_init()
     migrate_json_to_sqlite_if_needed()
 
@@ -369,6 +381,7 @@ def add_transaction(
     account_id: str,
     transfer_to_account_id: str = "",
 ) -> None:
+    # Every transaction is stored as one database row.
     transaction = Transaction(
         id=str(uuid4()),
         entry_date=entry_date.isoformat(),
@@ -409,6 +422,8 @@ def add_transfer(
     amount: float,
     note: str,
 ) -> None:
+    # A transfer is saved as a special transaction type so account balances can
+    # move money without affecting income/expense totals.
     accounts = accounts_by_id(st.session_state.accounts)
     from_name = accounts.get(from_account_id, Account(id="", name="(Unknown)", starting_balance=0.0)).name
     to_name = accounts.get(to_account_id, Account(id="", name="(Unknown)", starting_balance=0.0)).name
@@ -437,6 +452,7 @@ def build_dataframe(transactions: List[Transaction]) -> pd.DataFrame:
             columns=["Date", "Title", "Category", "Account", "Type", "Amount", "Note"]
         )
 
+    # Convert database objects into a table that Streamlit can display/filter.
     accounts = accounts_by_id(st.session_state.accounts)
     rows = []
     for item in transactions:
@@ -486,6 +502,7 @@ def filtered_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     selected_account = st.sidebar.selectbox("Account", accounts)
     search_text = st.sidebar.text_input("Search title or note")
 
+    # We filter a copy so the original dataframe stays unchanged.
     filtered = df.copy()
     if selected_type != "All":
         filtered = filtered[filtered["Type"] == selected_type]
@@ -504,6 +521,8 @@ def filtered_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_account_balances(all_df: pd.DataFrame) -> Dict[str, float]:
+    # Start from each account's opening balance, then replay all transactions
+    # to calculate the current balance for every account/card.
     balances: Dict[str, float] = {a.id: float(a.starting_balance) for a in st.session_state.accounts}
     if all_df.empty:
         return balances
@@ -545,7 +564,7 @@ def parse_pasted_data(text: str) -> pd.DataFrame:
             columns=["Date", "Title", "Category", "Account", "Type", "Amount", "Note"]
         )
 
-    # Try CSV first
+    # Try CSV first because it is the most structured input format.
     try:
         csv_df = pd.read_csv(pd.io.common.StringIO(raw))
         normalized = {c.strip().lower(): c for c in csv_df.columns}
@@ -569,7 +588,7 @@ def parse_pasted_data(text: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # Fallback: parse the "Income Expenses Tag Date Account Comment" table
+    # Fallback: parse the pasted tab-separated table from spreadsheets/messages.
     lines = [line.rstrip() for line in raw.splitlines() if line.strip()]
     if not lines:
         return pd.DataFrame(
@@ -620,6 +639,7 @@ def import_transactions_from_df(df: pd.DataFrame) -> Tuple[int, int]:
     imported = 0
     skipped = 0
 
+    # Import rows one by one so we can skip bad rows without failing the whole import.
     for _, row in df.iterrows():
         try:
             dt = parse_ddmmyyyy(str(row["Date"]))
@@ -647,6 +667,8 @@ def import_transactions_from_df(df: pd.DataFrame) -> Tuple[int, int]:
 
 
 def render_summary(df: pd.DataFrame) -> None:
+    # Summary cards ignore transfers on purpose. Transfers move money between
+    # accounts, but they do not create new income or new spending.
     income_total = float(df.loc[df["Type"] == "Income", "Amount"].sum()) if not df.empty else 0.0
     expense_total = float(df.loc[df["Type"] == "Expense", "Amount"].sum()) if not df.empty else 0.0
     balance = income_total - expense_total
@@ -691,6 +713,8 @@ def render_add_form() -> None:
 
 
 def render_manage_accounts() -> None:
+    # Keep account tools in the sidebar so the main page stays focused on
+    # daily transaction entry and reporting.
     st.sidebar.markdown("---")
     st.sidebar.header("Accounts/Cards")
 
@@ -777,6 +801,7 @@ def render_transactions(df: pd.DataFrame) -> None:
         st.info("No transactions yet. Add your first income or expense above.")
         return
 
+    # Hide internal IDs from the UI; they are only needed for program logic.
     drop_cols = [c for c in ["ID", "AccountID", "TransferToAccountID"] if c in df.columns]
     display_df = df.drop(columns=drop_cols).copy()
     display_df["Amount"] = display_df.apply(
@@ -819,6 +844,7 @@ def render_category_chart(df: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="💰", layout="wide")
 
+    # Stop early if the user is not logged in yet.
     if not render_login():
         return
 
