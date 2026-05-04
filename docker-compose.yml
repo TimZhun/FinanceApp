@@ -1,0 +1,15 @@
+# Run Finance Tracker with Docker Compose (Docker Desktop on Windows works well)
+services:
+  financeapp:
+    build: .
+    container_name: finance-tracker
+    ports:
+      - "8501:8501"
+    environment:
+      # Optional: username/password gate (omit both to disable auth)
+      - APP_USERNAME=${APP_USERNAME:-}
+      - APP_PASSWORD=${APP_PASSWORD:-}
+    volumes:
+      # Persist SQLite DB + backups on your Windows host under ./data
+      - ./data:/app/data
+    restart: unless-stopped

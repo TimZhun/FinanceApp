@@ -1,0 +1,18 @@
+# Avoid shipping local dev clutter or large data blobs into image layers
+.git
+.gitignore
+
+__pycache__
+*.py[cod]
+.venv
+venv
+
+# Local app data lives on host via compose volume bind
+data
+
+# Secrets should be passed via env in compose, not baked into images
+.streamlit/secrets.toml
+
+# Editor / IDE
+.idea
+.vscode

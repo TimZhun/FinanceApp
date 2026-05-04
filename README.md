@@ -95,6 +95,46 @@ Then open the app from another device using the server IP or Tailscale IP:
 
 - `http://<server-ip>:8501`
 
+## Run with Docker on Windows
+
+Assumes [Docker Desktop](https://www.docker.com/products/docker-desktop/) is installed.
+
+1. Open PowerShell in this project folder.
+
+2. (Optional) Create a `.env` file next to `docker-compose.yml` for login:
+
+   ```env
+   APP_USERNAME=admin
+   APP_PASSWORD=change-this-password
+   ```
+
+3. Build and start:
+
+   ```powershell
+   docker compose up --build
+   ```
+
+4. Open the app in your browser:
+
+   - `http://localhost:8501`
+
+### Data persistence
+
+Docker Compose mounts `./data` on your Windows host to `/app/data` in the container.
+
+That is where `data/finance.db` and the old JSON backups live, so your data survives container restarts.
+
+### Plain `docker run` (alternative)
+
+```powershell
+docker build -t finance-tracker .
+docker run --rm -p 8501:8501 `
+  -v "${PWD}/data:/app/data" `
+  -e APP_USERNAME=admin `
+  -e APP_PASSWORD=change-this-password `
+  finance-tracker
+```
+
 ## Notes
 
 - Data is stored locally in the project folder.

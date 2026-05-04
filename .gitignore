@@ -1,3 +1,4 @@
 #Data folder
 data/*
 .streamlit/secrets.toml
+.env
