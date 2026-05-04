@@ -111,13 +111,23 @@ def check_credentials(username: str, password: str) -> bool:
     )
 
 
-def make_cookie_manager() -> EncryptedCookieManager:
+@st.cache_resource
+def _cached_encrypted_cookie_manager(encryption_password: str) -> EncryptedCookieManager:
+    """
+    EncryptedCookieManager mounts a Streamlit custom component whose default key is fixed.
+    Instantiate it at most once per (prefix, password) — otherwise Streamlit raises
+    StreamlitDuplicateElementKey for CookieManager.sync_cookies.
+    """
+    return EncryptedCookieManager(prefix="financeapp/", password=encryption_password)
+
+
+def get_cookie_manager() -> EncryptedCookieManager:
     password = get_cookie_encryption_password()
     if not password:
         # We should only call this when `can_use_persistent_login()` is True.
         raise RuntimeError("Cookie encryption password is not configured.")
 
-    return EncryptedCookieManager(prefix="financeapp/", password=password)
+    return _cached_encrypted_cookie_manager(password)
 
 
 def ensure_cookies_ready(cookies: EncryptedCookieManager) -> None:
@@ -190,7 +200,7 @@ def render_login() -> bool:
 
     # Try Remember-me cookie if present.
     if is_auth_enabled() and can_use_persistent_login():
-        cookies_obj = make_cookie_manager()
+        cookies_obj = get_cookie_manager()
         ensure_cookies_ready(cookies_obj)
         max_ttl_seconds = 60 * 60 * 24 * 30
 
@@ -226,7 +236,7 @@ def render_login() -> bool:
                 st.session_state.is_authenticated = True
 
                 if remember_me and can_use_persistent_login():
-                    cookies_obj = make_cookie_manager()
+                    cookies_obj = get_cookie_manager()
                     ensure_cookies_ready(cookies_obj)
                     max_ttl_seconds = 60 * 60 * 24 * 30
                     expires_at = int(time.time()) + max_ttl_seconds
@@ -246,7 +256,7 @@ def render_logout() -> None:
     if is_auth_enabled() and st.sidebar.button("Log out", use_container_width=True):
         st.session_state.is_authenticated = False
         if can_use_persistent_login():
-            cookies_obj = make_cookie_manager()
+            cookies_obj = get_cookie_manager()
             ensure_cookies_ready(cookies_obj)
             if COOKIE_AUTH_KEY in cookies_obj:
                 cookies_obj.delete(COOKIE_AUTH_KEY)
