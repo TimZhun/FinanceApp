@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import json
 import os
 import sqlite3
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -12,6 +15,7 @@ from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
+from streamlit_cookies_manager import EncryptedCookieManager
 
 
 APP_TITLE = "Finance Tracker"
@@ -33,6 +37,9 @@ CATEGORIES = [
 ]
 
 
+COOKIE_AUTH_KEY = "finance_auth"
+
+
 # Read login credentials from Streamlit secrets first, then fall back to
 # environment variables. This lets us keep passwords out of the code.
 def get_auth_config() -> Tuple[str, str]:
@@ -50,6 +57,48 @@ def get_auth_config() -> Tuple[str, str]:
     return username, password
 
 
+def get_cookie_encryption_password() -> str:
+    value = ""
+
+    try:
+        value = str(st.secrets.get("COOKIE_ENCRYPT_PASSWORD", "")).strip()
+    except Exception:
+        pass
+
+    value = value or os.getenv("COOKIE_ENCRYPT_PASSWORD", "").strip()
+    _, app_password = get_auth_config()
+    return value or app_password
+
+
+def get_cookie_secret() -> str:
+    """
+    Signing key for Remember-me cookie payload.
+    Prefer a dedicated COOKIE_SECRET, otherwise fall back to APP_PASSWORD.
+
+    IMPORTANT: Changing COOKIE_SECRET/APP_PASSWORD will invalidate existing Remember-me cookies.
+    """
+    value = ""
+
+    try:
+        value = str(st.secrets.get("COOKIE_SECRET", "")).strip()
+    except Exception:
+        pass
+
+    value = value or os.getenv("COOKIE_SECRET", "").strip()
+    _, app_password = get_auth_config()
+    return value or app_password
+
+
+def can_use_persistent_login() -> bool:
+    """
+    Persistent login needs an encryption password for browser cookies plus a signing secret.
+    We default both to APP_PASSWORD when set, otherwise Remember-me stays disabled.
+    """
+    encrypt_password = get_cookie_encryption_password()
+    signing_secret = get_cookie_secret()
+    return bool(encrypt_password and signing_secret)
+
+
 def is_auth_enabled() -> bool:
     username, password = get_auth_config()
     return bool(username and password)
@@ -60,6 +109,67 @@ def check_credentials(username: str, password: str) -> bool:
     return hmac.compare_digest(username, expected_username) and hmac.compare_digest(
         password, expected_password
     )
+
+
+def make_cookie_manager() -> EncryptedCookieManager:
+    password = get_cookie_encryption_password()
+    if not password:
+        # We should only call this when `can_use_persistent_login()` is True.
+        raise RuntimeError("Cookie encryption password is not configured.")
+
+    return EncryptedCookieManager(prefix="financeapp/", password=password)
+
+
+def ensure_cookies_ready(cookies: EncryptedCookieManager) -> None:
+    # EncryptedCookieManager needs a short first-run handshake with the browser.
+    if not cookies.ready():
+        st.stop()
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(text: str) -> bytes:
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + pad)
+
+
+def build_remember_token(username: str, expires_at: int) -> str:
+    secret = get_cookie_secret()
+    username_n = username.strip()
+    payload = f"{username_n}|{int(expires_at)}".encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).digest()
+    signature = _b64url_encode(digest)
+    return f"{_b64url_encode(payload)}.{signature}"
+
+
+def verify_remember_token(token: str, max_ttl_seconds: int) -> Tuple[bool, str]:
+    try:
+        token_body, signature = token.split(".", 1)
+        payload_bytes = _b64url_decode(token_body)
+        username_raw, expires_raw = payload_bytes.decode("utf-8").split("|", 1)
+        username = username_raw.strip()
+        expires_at = int(expires_raw)
+
+        secret = get_cookie_secret()
+        expected = _b64url_encode(
+            hmac.new(secret.encode("utf-8"), payload_bytes, hashlib.sha256).digest()
+        )
+        if not hmac.compare_digest(signature, expected):
+            return False, ""
+
+        now_ts = int(time.time())
+        if expires_at <= now_ts:
+            return False, ""
+
+        issued_at = expires_at - int(max_ttl_seconds)
+        if issued_at > now_ts:
+            return False, ""
+
+        return True, username
+    except Exception:
+        return False, ""
 
 
 def render_login() -> bool:
@@ -78,17 +188,53 @@ def render_login() -> bool:
     if st.session_state.is_authenticated:
         return True
 
+    # Try Remember-me cookie if present.
+    if is_auth_enabled() and can_use_persistent_login():
+        cookies_obj = make_cookie_manager()
+        ensure_cookies_ready(cookies_obj)
+        max_ttl_seconds = 60 * 60 * 24 * 30
+
+        token = cookies_obj.get(COOKIE_AUTH_KEY)
+        ok, remembered_user = verify_remember_token(str(token), max_ttl_seconds=max_ttl_seconds) if token else (False, "")
+        expected_user = get_auth_config()[0]
+
+        if ok and hmac.compare_digest(remembered_user, expected_user.strip()):
+            st.session_state.is_authenticated = True
+            return True
+
     st.title(APP_TITLE)
     st.caption("Sign in to access your finance data.")
 
     with st.form("login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
+        remember_me_default = True if can_use_persistent_login() else False
+        remember_me = st.checkbox(
+            "Stay signed in on this browser (stores an encrypted cookie, not your password)",
+            value=remember_me_default,
+            disabled=not can_use_persistent_login(),
+        )
+        if not can_use_persistent_login():
+            st.caption(
+                "Remember-me requires APP_PASSWORD or COOKIE_ENCRYPT_PASSWORD + COOKIE_SECRET."
+            )
+
         submitted = st.form_submit_button("Sign in", use_container_width=True)
 
         if submitted:
             if check_credentials(username.strip(), password):
                 st.session_state.is_authenticated = True
+
+                if remember_me and can_use_persistent_login():
+                    cookies_obj = make_cookie_manager()
+                    ensure_cookies_ready(cookies_obj)
+                    max_ttl_seconds = 60 * 60 * 24 * 30
+                    expires_at = int(time.time()) + max_ttl_seconds
+                    cookies_obj[COOKIE_AUTH_KEY] = build_remember_token(
+                        username=username.strip(), expires_at=expires_at
+                    )
+                    cookies_obj.save()
+
                 st.rerun()
             else:
                 st.error("Invalid username or password.")
@@ -99,6 +245,12 @@ def render_login() -> bool:
 def render_logout() -> None:
     if is_auth_enabled() and st.sidebar.button("Log out", use_container_width=True):
         st.session_state.is_authenticated = False
+        if can_use_persistent_login():
+            cookies_obj = make_cookie_manager()
+            ensure_cookies_ready(cookies_obj)
+            if COOKIE_AUTH_KEY in cookies_obj:
+                cookies_obj.delete(COOKIE_AUTH_KEY)
+                cookies_obj.save()
         st.rerun()
 
 

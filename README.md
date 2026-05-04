@@ -65,6 +65,21 @@ The app now reads and writes through SQLite. The JSON files are kept as backup d
 
 Authentication is off by default. It turns on only when both credentials are set.
 
+### Stay signed in / password autofill
+
+Browsers often do not offer to save passwords for Streamlit login widgets the same way they do for normal websites.
+
+This app supports an optional **Stay signed in** checkbox. It stores an **encrypted cookie** (not your password in plain text) so you can refresh the page without logging in again until the cookie expires.
+
+If you want stronger separation between auth and cookie encryption, set these (optional):
+
+```env
+COOKIE_ENCRYPT_PASSWORD="a-long-random-string"
+COOKIE_SECRET="another-long-random-string"
+```
+
+If omitted, the app falls back to using `APP_PASSWORD` for both defaults (works, but rotate together).
+
 You can configure it in one of these ways:
 
 ### Option 1: Streamlit secrets

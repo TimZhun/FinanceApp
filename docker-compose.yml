@@ -9,6 +9,9 @@ services:
       # Optional: username/password gate (omit both to disable auth)
       - APP_USERNAME=${APP_USERNAME:-}
       - APP_PASSWORD=${APP_PASSWORD:-}
+      # Persist "Stay signed in" cookies (recommended for Docker)
+      - COOKIE_ENCRYPT_PASSWORD=${COOKIE_ENCRYPT_PASSWORD:-${APP_PASSWORD:-}}
+      - COOKIE_SECRET=${COOKIE_SECRET:-${APP_PASSWORD:-}}
     volumes:
       # Persist SQLite DB + backups on your Windows host under ./data
       - ./data:/app/data
